@@ -13,10 +13,11 @@
 #define MSG_TYPE_ACK      0x1   // ACK to last cmd
 #define MSG_TYPE_HOST_HB  0x2   // HOST -> STB : Heartbeat
 #define MSG_TYPE_UL_ITL   0x3   // HOST -> STB : set the update interval
-#define MSG_TYPT_Q_CTL    0x4   // STB -> CTL : to query the status
+#define MSG_TYPE_Q_CTL    0x4   // STB -> CTL : to query the status
 #define MSG_TYPE_CTL_STA  0x5   // CTL -> STB -> HOST : the control board status
-#define MSG_TYPT_S_GEAR   0x6   // HOST-> STB-> CTL: set the gear
-#define MSG_TYPE_MAX      0x7
+#define MSG_TYPE_S_GEAR   0x6   // HOST -> STB-> CTL: set the gear
+#define MSG_TYPE_TEMP     0x7   // STB -> HOST: send the temperature
+#define MSG_TYPE_MAX      0x8
 
 #define GPS_RATE          10
 
@@ -30,6 +31,8 @@
 
 #define TS_GPS_SAVE_DELTA  100   // 100ms after last gps data, to save
 #define TS_CTL_DATA_DELTA  20    // 20ms after last ctl data, to switch serial to GPS
+
+#define DHT11_PIN 5
 
 SoftwareSerial GPSSerial(6, 7); // RX, TX
 SoftwareSerial CtlSerial(8, 9); // RX, TX
@@ -84,7 +87,7 @@ typedef struct _saved_conf
   unsigned long gps_data_e;
 } Saved_conf;
 
-void gps_init()
+void gps_set_interval(unsigned char secs)
 {
   unsigned char send_buff[16], i, j, chk_a, chk_b;
   send_buff[0] = 0xB5;
@@ -96,8 +99,8 @@ void gps_init()
   send_buff[6] = 0xF0;
   for (i = 0; i < 6; i++) {
     send_buff[7] = i;
-    send_buff[8] = send_buff[9] = send_buff[10] = GPS_RATE;
-    send_buff[11] = send_buff[12] = send_buff[13] = GPS_RATE;
+    send_buff[8] = send_buff[9] = send_buff[10] = secs;
+    send_buff[11] = send_buff[12] = send_buff[13] = secs;
     chk_a = chk_b = 0;
     for (j = 0; j < 12; j++) {
       chk_a += send_buff[j + 2];
@@ -110,6 +113,11 @@ void gps_init()
     }
     delay(50);
   }
+}
+
+void gps_init()
+{
+  gps_set_interval(GPS_RATE);
 }
 
 void bt_init()
@@ -311,6 +319,7 @@ void setup()
   ts_last_gps = ts_last_ul = ts_last_ctl = ts_now = ts_delta = 0;
   ul_interval = 10000; // 10s as default
 
+  dht11_init(DHT11_PIN);
   spi_init();
   bt_init();
   delay(200); // wait for the gps module
@@ -482,9 +491,11 @@ void loop()
       ts_delta = (~ts_last_ul) + ts_now;
     if (host_connected && (ts_delta > ul_interval)) {
       // need to send update info to HOST.
-
+      unsigned char temp[5];
+      if (dht11_read(temp))
+        send_msg(0, MSG_TYPE_TEMP, 5, temp);
       // send Query msg to CTL, CTL needs to respond in TS_CTL_DATA_DELTA ms
-      send_msg(1, MSG_TYPT_Q_CTL, 0, NULL);
+      send_msg(1, MSG_TYPE_Q_CTL, 0, NULL);
       CtlSerial.listen();
       ts_last_ul = ts_last_ctl = ts_now;
     }
