@@ -31,6 +31,7 @@
 
 #define TS_GPS_SAVE_DELTA  100   // 100ms after last gps data, to save
 #define TS_CTL_DATA_DELTA  20    // 20ms after last ctl data, to switch serial to GPS
+#define TS_HB_TIMEOUT      20000 // 20s after last hearbeat, consider HOST lost
 
 #define DHT11_PIN 5
 
@@ -51,9 +52,9 @@ unsigned char sf_buf_idx, sf_buf_ptr, sf_gps_buf[2][SF_PAGE_SIZE], sf_saved_buf;
 // start end end address of the offline gps data
 unsigned long sf_gps_s, sf_gps_e;
 
-// timestamp of the last gps data, last info update to HOST, last ctl data
+// timestamp of the last gps data, last info update to HOST, last ctl data, last heartbeat
 // timestamp now, and the delta timestamp
-unsigned long ts_last_gps, ts_last_ul, ts_last_ctl, ts_now, ts_delta;
+unsigned long ts_last_gps, ts_last_ul, ts_last_ctl, ts_last_hb, ts_now;
 
 // update interval to HOST
 unsigned short ul_interval;
@@ -128,13 +129,17 @@ void bt_init()
 void process_cmd()
 {
   char i;
+  /*
   Serial.write(START_BYTE);
   Serial.write((cmd_type << MSG_TYPE_OFFSET) | cmd_len);
   for (i = 0; i < cmd_len; i++)
     Serial.write(cmd_buff[i]);
+  */
 
   switch (cmd_type) {
-    case MSG_TYPE_UL_ITL:
+    case MSG_TYPE_HOST_HB:
+      ts_last_hb = millis();
+      sys_sta |= SYS_STA_HOST;
       break;
     default:
       break;
@@ -306,6 +311,14 @@ void send_msg(unsigned char port, unsigned char msg_type, unsigned char msg_len,
   }
 }
 
+unsigned long get_ts_delta(unsigned long ts_old, unsigned long ts_new)
+{
+  if (ts_new > ts_old)
+    return (ts_new - ts_old);
+  else
+    return ((~ts_old) + ts_new);
+}
+
 void setup()
 {
   Serial.begin(9600);
@@ -316,7 +329,7 @@ void setup()
   sf_buf_ptr = sf_buf_idx = 0;
   sf_gps_s = sf_gps_e = SF_GPS_OFFSET; // start from 8K
   sf_saved_buf = !sf_buf_idx;
-  ts_last_gps = ts_last_ul = ts_last_ctl = ts_now = ts_delta = 0;
+  ts_last_gps = ts_last_ul = ts_last_ctl  = ts_last_hb = ts_now = 0;
   ul_interval = 10000; // 10s as default
 
   dht11_init(DHT11_PIN);
@@ -458,11 +471,7 @@ void loop()
   if (ts_last_gps) {
     // still have gps data received.
     ts_now = millis();
-    if (ts_now > ts_last_gps)
-      ts_delta = ts_now - ts_last_gps;
-    else
-      ts_delta = (~ts_last_gps) + ts_now;
-    if (ts_delta > TS_GPS_SAVE_DELTA) {
+    if (get_ts_delta(ts_last_gps, ts_now) > TS_GPS_SAVE_DELTA) {
 #ifdef DBG_GENERAL
       unsigned long save_start, save_end;
       Serial.println(ts_last_gps);
@@ -485,11 +494,7 @@ void loop()
   if (!ts_last_gps) {
     // should be safe to do other things here.
     ts_now = millis();
-    if (ts_now > ts_last_ul)
-      ts_delta = ts_now - ts_last_ul;
-    else
-      ts_delta = (~ts_last_ul) + ts_now;
-    if (host_connected && (ts_delta > ul_interval)) {
+    if (host_connected && (get_ts_delta(ts_last_ul, ts_now) > ul_interval)) {
       // need to send update info to HOST.
       unsigned char temp[5];
       if (dht11_read(temp))
@@ -504,13 +509,19 @@ void loop()
   if (ts_last_ctl) {
     // still have ctl data received.
     ts_now = millis();
-    if (ts_now > ts_last_ctl)
-      ts_delta = ts_now - ts_last_ctl;
-    else
-      ts_delta = (~ts_last_ctl) + ts_now;
-    if (ts_delta > TS_CTL_DATA_DELTA) {
+    if (get_ts_delta(ts_last_ctl, ts_now) > TS_CTL_DATA_DELTA) {
       GPSSerial.listen();
       ts_last_ctl = 0;
     }
   }
+
+#ifndef DBG_PC_AS_HOST
+  if (host_connected) {
+    ts_now = millis();
+    if (get_ts_delta(ts_last_hb, ts_now) > TS_HB_TIMEOUT) {
+      // No heartbeat from HOST for TS_HB_TIMEOUT seconds, lost HOST
+      sys_sta &= ~SYS_STA_HOST;
+    }
+  }
+#endif
 }
