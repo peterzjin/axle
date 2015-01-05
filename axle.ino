@@ -90,6 +90,28 @@ typedef struct _saved_conf
 
 void gps_set_interval(unsigned char secs)
 {
+  unsigned char send_buff[14] = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0x00,
+                                 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00};
+  unsigned char i, chk_a, chk_b;
+  unsigned short msecs = secs * 1000;
+  send_buff[6] = (unsigned char)msecs;
+  send_buff[7] = (unsigned char)(msecs >> 8);
+  chk_a = chk_b = 0;
+  for (i = 0; i < 10; i++) {
+    chk_a += send_buff[i + 2];
+    chk_b += chk_a;
+  }
+  send_buff[12] = chk_a;
+  send_buff[13] = chk_b;
+  for (i = 0; i < 14; i++) {
+    GPSSerial.write(send_buff[i]);
+    Serial.write(send_buff[i]);
+  }
+}
+
+/*
+void gps_set_interval(unsigned char secs)
+{
   unsigned char send_buff[16], i, j, chk_a, chk_b;
   send_buff[0] = 0xB5;
   send_buff[1] = 0x62;
@@ -115,6 +137,7 @@ void gps_set_interval(unsigned char secs)
     delay(50);
   }
 }
+*/
 
 void gps_init()
 {
