@@ -66,7 +66,7 @@ void spi_init()
   pinMode(MISO,INPUT_PULLUP);
   SPI.begin();
   SPI.setBitOrder(MSBFIRST);
-  SPI.setClockDivider(SPI_CLOCK_DIV64);
+  SPI.setClockDivider(SPI_CLOCK_DIV16);
   SPI.setDataMode(SPI_MODE0);
   deselect();
 }
@@ -229,4 +229,10 @@ void sf_erasesct(uint32_t addr_start)
   deselect();
 }
 
+void sf_erasechp(void)
+{
+  select();
+  SPI.transfer(CHIP_ERASE);
+  deselect();
+}
 

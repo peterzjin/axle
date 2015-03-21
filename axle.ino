@@ -387,6 +387,14 @@ void setup()
   unsigned long addr = 0;
   unsigned long start, write_end, read_end;
 
+  // erase the whole chip
+#if 0
+  sf_wait(500);
+  sf_we(true);
+  sf_erasechp();
+  sf_wait(5000);
+#endif
+
   for (int i = 0; i < SF_PAGE_SIZE; i++)
     dbg_buf[i] = DBG_BYTE;
 
