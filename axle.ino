@@ -33,7 +33,10 @@
 #define TS_CTL_DATA_DELTA  20    // 20ms after last ctl data, to switch serial to GPS
 #define TS_HB_TIMEOUT      20000 // 20s after last hearbeat, consider HOST lost
 
+//#define HAVE_DHT11
+#ifdef HAVE_DHT11
 #define DHT11_PIN 5
+#endif
 
 SoftwareSerial GPSSerial(6, 7); // RX, TX
 SoftwareSerial CtlSerial(8, 9); // RX, TX
@@ -355,7 +358,9 @@ void setup()
   ts_last_gps = ts_last_ul = ts_last_ctl  = ts_last_hb = ts_now = 0;
   ul_interval = 10000; // 10s as default
 
+#ifdef HAVE_DHT11
   dht11_init(DHT11_PIN);
+#endif
   spi_init();
   bt_init();
   delay(200); // wait for the gps module
@@ -527,9 +532,11 @@ void loop()
     ts_now = millis();
     if (host_connected && (get_ts_delta(ts_last_ul, ts_now) > ul_interval)) {
       // need to send update info to HOST.
+#ifdef HAVE_DHT11
       unsigned char temp[5];
       if (dht11_read(temp))
         send_msg(0, MSG_TYPE_TEMP, 5, temp);
+#endif
       // send Query msg to CTL, CTL needs to respond in TS_CTL_DATA_DELTA ms
       send_msg(1, MSG_TYPE_Q_CTL, 0, NULL);
       CtlSerial.listen();
