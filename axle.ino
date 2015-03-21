@@ -17,7 +17,11 @@
 #define MSG_TYPE_CTL_STA  0x5   // CTL -> STB -> HOST : the control board status
 #define MSG_TYPE_S_GEAR   0x6   // HOST -> STB-> CTL: set the gear
 #define MSG_TYPE_TEMP     0x7   // STB -> HOST: send the temperature
-#define MSG_TYPE_MAX      0x8
+#define MSG_TYPE_Q_GPS    0x8   // HOST -> STB: query the size of the offline GPS data
+#define MSG_TYPE_G_GPS    0x9   // HOST -> STB: get the offline GPS data
+#define MSG_TYPE_S_GPS    0xA   // STB -> HOST: send the offline GPS data
+#define MSG_TYPE_A_GPS    0xB   // STB -> HOST: have sent out all the offline GPS data
+#define MSG_TYPE_MAX      0xC
 
 #define GPS_RATE          10
 
@@ -30,6 +34,7 @@
 #define SF_CONF_SIZE     8192    // 8K
 
 #define TS_GPS_SAVE_DELTA  100   // 100ms after last gps data, to save
+#define TS_SAFE_DELTA      100   // stop sending the offline GPS data 100ms before next GPS data
 #define TS_CTL_DATA_DELTA  20    // 20ms after last ctl data, to switch serial to GPS
 #define TS_HB_TIMEOUT      20000 // 20s after last hearbeat, consider HOST lost
 
@@ -50,17 +55,23 @@ unsigned char cmd_status;
 
 unsigned char cmd_type, cmd_len, buff_ptr, cmd_buff[MSG_LEN_MAX + 2];
 
-unsigned char sf_buf_idx, sf_buf_ptr, sf_gps_buf[2][SF_PAGE_SIZE], sf_saved_buf;
+unsigned char sf_buf_idx, sf_buf_ptr, sf_gps_buf[2][SF_PAGE_SIZE], sf_saved_buf, sf_gps_send_buf[SF_PAGE_SIZE];
 
 // start end end address of the offline gps data
 unsigned long sf_gps_s, sf_gps_e;
 
-// timestamp of the last gps data, last info update to HOST, last ctl data, last heartbeat
-// timestamp now, and the delta timestamp
-unsigned long ts_last_gps, ts_last_ul, ts_last_ctl, ts_last_hb, ts_now;
+// timestamp of the first gps data, last gps data, last info update to HOST, last ctl data
+// last heartbeat, timestamp now, and the delta timestamp
+unsigned long ts_first_gps, ts_last_gps, ts_last_ul, ts_last_ctl, ts_last_hb, ts_now;
 
 // update interval to HOST
 unsigned short ul_interval;
+
+// upload mode of GPS offline data
+// 0: stop upload the GPS offline data
+// 1: just upload the GPS offline data, ignore any other operations
+// 2: upload the GPS offline data when the device is idle
+unsigned char gps_ul_mode;
 
 /* debug the SPI FLASH read and write */
 //#define DBG_SPI_FLASH
@@ -154,22 +165,52 @@ void bt_init()
 
 void process_cmd()
 {
-  char i;
   /*
+  char i;
   Serial.write(START_BYTE);
   Serial.write((cmd_type << MSG_TYPE_OFFSET) | cmd_len);
   for (i = 0; i < cmd_len; i++)
     Serial.write(cmd_buff[i]);
   */
+  unsigned char value, send_ack = 1;
 
   switch (cmd_type) {
     case MSG_TYPE_HOST_HB:
       ts_last_hb = millis();
       sys_sta |= SYS_STA_HOST;
       break;
+    case MSG_TYPE_UL_ITL:
+      value = cmd_buff[0];
+      ul_interval = value * 1000;
+      gps_set_interval(value);
+      break;
+    case MSG_TYPE_S_GEAR:
+    // send the value directly to CTL.
+      send_msg(1, MSG_TYPE_S_GEAR, 1, cmd_buff);
+      break;
+    case MSG_TYPE_Q_GPS:
+      unsigned long cur_size;
+      if (sf_gps_e < sf_gps_s)
+        cur_size = sf_gps_e + SF_CHIP_SIZE - SF_GPS_OFFSET - sf_gps_s;
+      else
+        cur_size = sf_gps_e - sf_gps_s;
+      send_msg(0, MSG_TYPE_Q_GPS, 4, (unsigned char *)&cur_size);
+      send_ack = 0;
+      break;
+    case MSG_TYPE_G_GPS:
+      value = cmd_buff[0];
+      if (value > 2)
+        send_ack = 0;
+      else
+        gps_ul_mode = value;
+      break;
     default:
+      send_ack = 0;
       break;
   }
+
+  if (send_ack)
+    send_msg(0, MSG_TYPE_ACK, 0, NULL);
 }
 
 void load_conf_from_sf()
@@ -316,6 +357,22 @@ void save_offline_gps(unsigned char data)
   }
 }
 
+// send one page of the GPS offline data
+void send_offline_gps_gp(unsigned long addr)
+{
+  int i;
+
+  send_msg(0, MSG_TYPE_S_GPS, 4, (unsigned char *)&addr);
+
+  sf_wait(500);
+  sf_read(addr, sf_gps_send_buf, SF_PAGE_SIZE);
+
+  for (i = 0; i < SF_PAGE_SIZE; i++)
+    Serial.write(sf_gps_send_buf[i]);
+
+  send_msg(0, MSG_TYPE_S_GPS, 0, NULL);
+}
+
 // port 0 for the HOST
 // port 1 for the CTL
 void send_msg(unsigned char port, unsigned char msg_type, unsigned char msg_len, unsigned char *msg)
@@ -355,8 +412,9 @@ void setup()
   sf_buf_ptr = sf_buf_idx = 0;
   sf_gps_s = sf_gps_e = SF_GPS_OFFSET; // start from 8K
   sf_saved_buf = !sf_buf_idx;
-  ts_last_gps = ts_last_ul = ts_last_ctl  = ts_last_hb = ts_now = 0;
+  ts_first_gps = ts_last_gps = ts_last_ul = ts_last_ctl  = ts_last_hb = ts_now = 0;
   ul_interval = 10000; // 10s as default
+  gps_ul_mode = 0;
 
 #ifdef HAVE_DHT11
   dht11_init(DHT11_PIN);
@@ -445,29 +503,6 @@ void setup()
 
 void loop()
 {
-  // send the GPS data to HOST directly if HOST connected
-  // or save the GPS data to flash
-  while (GPSSerial.available() > 0) {
-    ser_char = GPSSerial.read();
-    if (host_connected)
-      Serial.write(ser_char);
-    else
-      save_offline_gps(ser_char);
-
-    ts_last_gps = millis();
-  }
-
-  // send the CTL data to HOST directly if HOST connected
-  // or just discard.
-  //CtlSerial.listen();
-  while (CtlSerial.available() > 0) {
-    ser_char = GPSSerial.read();
-    if (host_connected)
-      Serial.write(ser_char);
-
-    ts_last_ctl = millis();
-  }
-
   while (Serial.available() > 0) {
     ser_char = Serial.read();
     // if got a START_BYTE, reset the cmd_status to 1.
@@ -502,6 +537,54 @@ void loop()
         cmd_status = 0;
         break;
     }
+  }
+
+// mode 1: just upload the GPS offline data, and ignore any other operations
+// mode 2: upload the GPS offline data if idle (no GPS and CTL data, and 100ms before next GPS data)
+  if (gps_ul_mode == 1 ||
+        (gps_ul_mode == 2
+          && !ts_last_gps && !ts_last_ctl
+          && get_ts_delta(ts_first_gps, millis()) < (ul_interval - TS_SAFE_DELTA))) {
+    if (!host_connected) {
+      gps_ul_mode = 0;
+    } else {
+      send_offline_gps_gp(sf_gps_s);
+      sf_gps_s += SF_PAGE_SIZE;
+      if (sf_gps_s >= SF_CHIP_SIZE)
+        sf_gps_s = SF_GPS_OFFSET;
+      if (sf_gps_s == sf_gps_e) {
+        send_msg(0, MSG_TYPE_A_GPS, 0, NULL);
+        gps_ul_mode = 0;
+      }
+    }
+    return;
+  }
+
+  // send the GPS data to HOST directly if HOST connected
+  // or save the GPS data to flash
+  while (GPSSerial.available() > 0) {
+    ser_char = GPSSerial.read();
+    if (host_connected)
+      Serial.write(ser_char);
+    else
+      save_offline_gps(ser_char);
+
+    if (ts_last_gps == 0) {
+      // first GPS data comes
+      ts_first_gps = millis();
+    }
+    ts_last_gps = millis();
+  }
+
+  // send the CTL data to HOST directly if HOST connected
+  // or just discard.
+  //CtlSerial.listen();
+  while (CtlSerial.available() > 0) {
+    ser_char = GPSSerial.read();
+    if (host_connected)
+      Serial.write(ser_char);
+
+    ts_last_ctl = millis();
   }
 
   if (ts_last_gps) {
