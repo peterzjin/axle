@@ -178,6 +178,9 @@ void process_cmd()
     case MSG_TYPE_HOST_HB:
       ts_last_hb = millis();
       sys_sta |= SYS_STA_HOST;
+      save_to_sf();
+      sf_buf_ptr = sf_buf_idx = 0;
+      sf_saved_buf = !sf_buf_idx;
       break;
     case MSG_TYPE_UL_ITL:
       value = cmd_buff[0];
@@ -203,6 +206,9 @@ void process_cmd()
         send_ack = 0;
       else
         gps_ul_mode = value;
+      save_to_sf();
+      sf_buf_ptr = sf_buf_idx = 0;
+      sf_saved_buf = !sf_buf_idx;
       break;
     default:
       send_ack = 0;
@@ -279,6 +285,22 @@ void update_conf_to_sf()
   sf_writepg_n(addr, (unsigned char *)&tmp, sizeof(Saved_conf));
 }
 
+void send_to_host()
+{
+  int i;
+
+  if (sf_buf_idx) {
+    for (i = 0; i < SF_PAGE_SIZE; i++)
+      Serial.write(sf_gps_buf[0][i]);
+  }
+
+  for (i = 0; i < sf_buf_ptr; i++)
+    Serial.write(sf_gps_buf[sf_buf_idx][i]);
+
+  sf_buf_ptr = sf_buf_idx = 0;
+  sf_saved_buf = !sf_buf_idx;
+}
+
 void save_to_sf()
 {
   unsigned char to_save = !sf_saved_buf;
@@ -342,7 +364,7 @@ void save_to_sf()
   update_conf_to_sf();
 }
 
-void save_offline_gps(unsigned char data)
+void save_gps_data(unsigned char data)
 {
   sf_gps_buf[sf_buf_idx][sf_buf_ptr++] = data;
 
@@ -352,7 +374,10 @@ void save_offline_gps(unsigned char data)
     // too many date received, last buffer hasn't been saved !!!
     // normally, it should NOT happen!!!
     if (sf_buf_idx != sf_saved_buf) {
-      save_to_sf();
+      if (host_connected)
+        send_to_host();
+      else
+        save_to_sf();
     }
   }
 }
@@ -564,10 +589,7 @@ void loop()
   // or save the GPS data to flash
   while (GPSSerial.available() > 0) {
     ser_char = GPSSerial.read();
-    if (host_connected)
-      Serial.write(ser_char);
-    else
-      save_offline_gps(ser_char);
+    save_gps_data(ser_char);
 
     if (ts_last_gps == 0) {
       // first GPS data comes
@@ -580,7 +602,7 @@ void loop()
   // or just discard.
   //CtlSerial.listen();
   while (CtlSerial.available() > 0) {
-    ser_char = GPSSerial.read();
+    ser_char = CtlSerial.read();
     if (host_connected)
       Serial.write(ser_char);
 
@@ -599,7 +621,9 @@ void loop()
       Serial.println(sf_buf_ptr);
       save_start = millis();
 #endif
-      if (!host_connected)
+      if (host_connected)
+        send_to_host();
+      else
         save_to_sf();
 #ifdef DBG_GENERAL
       save_end = millis();
@@ -642,6 +666,9 @@ void loop()
     if (get_ts_delta(ts_last_hb, ts_now) > TS_HB_TIMEOUT) {
       // No heartbeat from HOST for TS_HB_TIMEOUT seconds, lost HOST
       sys_sta &= ~SYS_STA_HOST;
+      sf_buf_ptr = sf_buf_idx = 0;
+      sf_saved_buf = !sf_buf_idx;
+      gps_ul_mode = 0;
     }
   }
 #endif
