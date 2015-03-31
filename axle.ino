@@ -38,6 +38,8 @@
 #define TS_CTL_DATA_DELTA  20    // 20ms after last ctl data, to switch serial to GPS
 #define TS_HB_TIMEOUT      20000 // 20s after last hearbeat, consider HOST lost
 
+#define GPS_BUF_NUM  3
+
 //#define HAVE_DHT11
 #ifdef HAVE_DHT11
 #define DHT11_PIN 5
@@ -55,7 +57,7 @@ unsigned char cmd_status;
 
 unsigned char cmd_type, cmd_len, buff_ptr, cmd_buff[MSG_LEN_MAX + 2];
 
-unsigned char sf_buf_idx, sf_buf_ptr, sf_gps_buf[2][SF_PAGE_SIZE], sf_saved_buf, sf_gps_send_buf[SF_PAGE_SIZE];
+unsigned char sf_buf_idx, sf_buf_ptr, sf_gps_buf[GPS_BUF_NUM][SF_PAGE_SIZE], sf_saved_buf, sf_gps_send_buf[SF_PAGE_SIZE];
 
 // start end end address of the offline gps data
 unsigned long sf_gps_s, sf_gps_e;
@@ -176,11 +178,12 @@ void process_cmd()
 
   switch (cmd_type) {
     case MSG_TYPE_HOST_HB:
+      if (!host_connected) {
+        save_to_sf();
+        sf_buf_ptr = sf_buf_idx = 0;
+        sf_saved_buf = GPS_BUF_NUM - 1;
+      }
       ts_last_hb = millis();
-      sys_sta |= SYS_STA_HOST;
-      save_to_sf();
-      sf_buf_ptr = sf_buf_idx = 0;
-      sf_saved_buf = !sf_buf_idx;
       break;
     case MSG_TYPE_UL_ITL:
       value = cmd_buff[0];
@@ -206,14 +209,18 @@ void process_cmd()
         send_ack = 0;
       else
         gps_ul_mode = value;
-      save_to_sf();
-      sf_buf_ptr = sf_buf_idx = 0;
-      sf_saved_buf = !sf_buf_idx;
+      if (!host_connected) {
+        save_to_sf();
+        sf_buf_ptr = sf_buf_idx = 0;
+        sf_saved_buf = GPS_BUF_NUM - 1;
+      }
       break;
     default:
       send_ack = 0;
       break;
   }
+
+  sys_sta |= SYS_STA_HOST;
 
   if (send_ack)
     send_msg(0, MSG_TYPE_ACK, 0, NULL);
@@ -272,12 +279,20 @@ void update_conf_to_sf()
       ||!(tmp.magic_byte == 0xFF && tmp.gps_data_s == 0xFFFFFFFF && tmp.gps_data_e == 0xFFFFFFFF)) {
     // case 1: the configration storage is full,
     // case 2: not magic byte, not erased page, something wrong happened,
-    // so erase this sector and start over.
+    // so start over.
     addr = SF_CONF_OFFSET;
+  }
+
+  // erase the sector
+  if (!(addr & (SF_SECT_SIZE - 1))) {
     sf_wait(500);
     sf_we(true);
     sf_erasesct(addr);
   }
+
+  tmp.magic_byte = START_BYTE;
+  tmp.gps_data_s = sf_gps_s;
+  tmp.gps_data_e = sf_gps_e;
 
   // page available to write
   sf_wait(500);
@@ -287,79 +302,86 @@ void update_conf_to_sf()
 
 void send_to_host()
 {
-  int i;
+  int i, j;
 
-  if (sf_buf_idx) {
+  for (j = 0; j < sf_buf_idx; j++) {
     for (i = 0; i < SF_PAGE_SIZE; i++)
-      Serial.write(sf_gps_buf[0][i]);
+      Serial.write(sf_gps_buf[j][i]);
   }
 
   for (i = 0; i < sf_buf_ptr; i++)
     Serial.write(sf_gps_buf[sf_buf_idx][i]);
 
   sf_buf_ptr = sf_buf_idx = 0;
-  sf_saved_buf = !sf_buf_idx;
+  sf_saved_buf = GPS_BUF_NUM - 1;
 }
 
 void save_to_sf()
 {
-  unsigned char to_save = !sf_saved_buf;
+  unsigned char to_save;
   unsigned long cur_size;
 
-  // the buffer to save is not full yet!
-  if (!flash_ok || to_save == sf_buf_idx)
+  if (!flash_ok)
     return;
 
-  // if we need a new sector, erase it first.
-  if (!(sf_gps_e & (SF_SECT_SIZE - 1))) {
+  while (1) {
+    to_save = (sf_saved_buf == GPS_BUF_NUM - 1) ? 0 : (sf_saved_buf + 1);
+
+    // the buffer to save is not full yet!
+    if (to_save == sf_buf_idx)
+      break;
+
+    // if we need a new sector, erase it first.
+    if (!(sf_gps_e & (SF_SECT_SIZE - 1))) {
+      sf_wait(500);
+      sf_we(true);
+      sf_erasesct(sf_gps_e);
+    }
+
     sf_wait(500);
     sf_we(true);
-    sf_erasesct(sf_gps_e);
-  }
+    sf_writepg(sf_gps_e, sf_gps_buf[to_save]);
 
-  sf_wait(500);
-  sf_we(true);
-  sf_writepg(sf_gps_e, sf_gps_buf[to_save]);
+  #ifdef DBG_GPS_SF
+    /*
+    for(int i = 0; i < SF_PAGE_SIZE; i++)
+      Serial.print(sf_gps_buf[to_save][i], HEX);
+    Serial.println("");
+    */
+    sf_wait(500);
+    sf_read(sf_gps_e, dbg_buf_sf, SF_PAGE_SIZE);
+    if (memcmp(sf_gps_buf[to_save], dbg_buf_sf))
+      Serial.println("ERROR!!!");
+    /*
+    for(int i = 0; i < SF_PAGE_SIZE; i++)
+      Serial.print(dbg_buf[i], HEX);
+    Serial.println("");
+    */
+  #endif
 
-#ifdef DBG_GPS_SF
-  /*
-  for(int i = 0; i < SF_PAGE_SIZE; i++)
-    Serial.print(sf_gps_buf[to_save][i], HEX);
-  Serial.println("");
-  */
-  sf_wait(500);
-  sf_read(sf_gps_e, dbg_buf_sf, SF_PAGE_SIZE);
-  if (memcmp(sf_gps_buf[to_save], dbg_buf_sf))
-    Serial.println("ERROR!!!");
-  /*
-  for(int i = 0; i < SF_PAGE_SIZE; i++)
-    Serial.print(dbg_buf[i], HEX);
-  Serial.println("");
-  */
-#endif
+    sf_gps_e += SF_PAGE_SIZE;
 
-  sf_gps_e += SF_PAGE_SIZE;
+    // if stored GPS data size bigger than SF_GPS_SIZE,
+    // update the sf_gps_s first.
+    if (sf_gps_e < sf_gps_s)
+      cur_size = sf_gps_e + SF_CHIP_SIZE - SF_GPS_OFFSET - sf_gps_s;
+    else
+      cur_size = sf_gps_e - sf_gps_s;
 
-  // if stored GPS data size bigger than SF_GPS_SIZE,
-  // update the sf_gps_s first.
-  if (sf_gps_e < sf_gps_s)
-    cur_size = sf_gps_e + SF_CHIP_SIZE - SF_GPS_OFFSET - sf_gps_s;
-  else
-    cur_size = sf_gps_e - sf_gps_s;
+    // stored too much data.
+    if (cur_size > SF_GPS_SIZE) {
+      sf_gps_s += (cur_size - SF_GPS_SIZE);
+      // if overlapped
+      if (sf_gps_s >= SF_CHIP_SIZE)
+        sf_gps_s = SF_GPS_OFFSET;
+    }
 
-  // stored too much data.
-  if (cur_size > SF_GPS_SIZE) {
-    sf_gps_s += (cur_size - SF_GPS_SIZE);
     // if overlapped
-    if (sf_gps_s >= SF_CHIP_SIZE)
-      sf_gps_s = SF_GPS_OFFSET;
+    if (sf_gps_e >= SF_CHIP_SIZE)
+      sf_gps_e = SF_GPS_OFFSET;
+
+    sf_saved_buf = to_save;
   }
-
-  // if overlapped
-  if (sf_gps_e >= SF_CHIP_SIZE)
-    sf_gps_e = SF_GPS_OFFSET;
-
-  sf_saved_buf = to_save;
 
   update_conf_to_sf();
 }
@@ -370,15 +392,18 @@ void save_gps_data(unsigned char data)
 
   // it is time to swift the buffer.
   if (sf_buf_ptr == 0) {
-    sf_buf_idx = !sf_buf_idx;
     // too many date received, last buffer hasn't been saved !!!
     // normally, it should NOT happen!!!
-    if (sf_buf_idx != sf_saved_buf) {
+    if (sf_buf_idx == sf_saved_buf) {
       if (host_connected)
         send_to_host();
       else
         save_to_sf();
-    }
+      }
+
+    sf_buf_idx++;
+    if (sf_buf_idx == GPS_BUF_NUM)
+      sf_buf_idx = 0;
   }
 }
 
@@ -435,10 +460,10 @@ void setup()
 
   ser_char = cmd_status = cmd_type = cmd_len = buff_ptr = sys_sta = 0;
   sf_buf_ptr = sf_buf_idx = 0;
+  sf_saved_buf = GPS_BUF_NUM - 1;
   sf_gps_s = sf_gps_e = SF_GPS_OFFSET; // start from 8K
-  sf_saved_buf = !sf_buf_idx;
   ts_first_gps = ts_last_gps = ts_last_ul = ts_last_ctl  = ts_last_hb = ts_now = 0;
-  ul_interval = 10000; // 10s as default
+  ul_interval = GPS_RATE * 1000; // 10s as default
   gps_ul_mode = 0;
 
 #ifdef HAVE_DHT11
@@ -667,7 +692,7 @@ void loop()
       // No heartbeat from HOST for TS_HB_TIMEOUT seconds, lost HOST
       sys_sta &= ~SYS_STA_HOST;
       sf_buf_ptr = sf_buf_idx = 0;
-      sf_saved_buf = !sf_buf_idx;
+      sf_saved_buf = GPS_BUF_NUM - 1;
       gps_ul_mode = 0;
     }
   }
